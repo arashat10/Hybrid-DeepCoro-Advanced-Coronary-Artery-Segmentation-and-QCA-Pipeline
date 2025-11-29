@@ -1,0 +1,344 @@
+import os
+import cv2
+import json
+import torch
+import gc
+import numpy as np
+import pandas as pd
+import math
+import matplotlib.pyplot as plt
+from skimage.morphology import skeletonize
+from scipy.ndimage import distance_transform_edt
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
+import segmentation_models_pytorch as smp
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+from tqdm.notebook import tqdm
+from scipy.interpolate import make_interp_spline
+
+# ---------------------------------------------------------
+# 1. 🕵️‍♂️ DATASET SCANNER
+# ---------------------------------------------------------
+def find_all_datasets():
+    print("🕵️‍♂️ Scanning Kaggle Input for Data...")
+    found = []
+    search_roots = ['/kaggle/input', '/content']
+    
+    for base in search_roots:
+        if not os.path.exists(base): continue
+        for root, dirs, files in os.walk(base):
+            if 'train.json' in files:
+                cat = 'syntax' if 'syntax' in root.lower() else 'stenosis'
+                img_dir = None
+                candidates = [
+                    os.path.join(root, 'images'),
+                    os.path.join(os.path.dirname(root), 'images'),
+                    os.path.join(root.replace('annotations', 'images'))
+                ]
+                for c in candidates:
+                    if os.path.exists(c):
+                        img_dir = c
+                        break
+                
+                if img_dir:
+                    val_root = root.replace('train', 'val')
+                    val_json = os.path.join(val_root, 'val.json')
+                    if not os.path.exists(val_json):
+                         val_json = os.path.join(os.path.dirname(root).replace('train', 'val'), 'annotations', 'val.json')
+                    
+                    val_img = img_dir.replace('train', 'val')
+                    if os.path.exists(val_json):
+                        found.append({'train_json': os.path.join(root, 'train.json'), 'train_img': img_dir, 'val_json': val_json, 'val_img': val_img, 'cat': cat})
+                        print(f"   ✅ Locked Target: {cat.upper()} dataset")
+
+    if not found: raise FileNotFoundError("❌ Critical: No datasets found!")
+    return found
+
+# ---------------------------------------------------------
+# 2. ⚙️ CONFIGURATION
+# ---------------------------------------------------------
+class Config:
+    IMAGE_SIZE = 512
+    BATCH_SIZE = 4
+    NUM_EPOCHS = 25 # تعداد اپوک مناسب برای رسیدن به دقت بالا
+    LEARNING_RATE = 1e-4
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    SAVE_DIR = './working/output_research'
+    PIXEL_TO_MM = 0.3
+
+os.makedirs(Config.SAVE_DIR, exist_ok=True)
+sources = find_all_datasets()
+
+# ---------------------------------------------------------
+# 3. 💿 DATASET & AUGMENTATION (Fixed)
+# ---------------------------------------------------------
+class ResearchDataset(Dataset):
+    def __init__(self, sources, split='train', transform=None):
+        self.transform = transform
+        self.samples = []
+        for src in sources:
+            jp, idir = src[f'{split}_json'], src[f'{split}_img']
+            try:
+                with open(jp, 'r') as f: data = json.load(f)
+                anns = {}
+                for a in data.get('annotations', []): anns.setdefault(a['image_id'], []).append(a)
+                for i in data['images']:
+                    self.samples.append({'p': os.path.join(idir, i['file_name']), 'a': anns.get(i['id'], []), 'h': i['height'], 'w': i['width']})
+            except: pass
+        print(f"🔥 {split.upper()} LOADED: {len(self.samples)} samples")
+
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        img = cv2.imread(s['p'])
+        if img is None: return torch.zeros((3, 512, 512)), torch.zeros((512, 512)).long()
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        mask = np.zeros((s['h'], s['w']), dtype=np.uint8)
+        for ann in s['a']:
+            for seg in ann['segmentation']:
+                cv2.fillPoly(mask, [np.array(seg).reshape(-1, 2).astype(np.int32)], 1)
+        
+        if self.transform:
+            aug = self.transform(image=img, mask=mask)
+            img, mask = aug['image'], aug['mask']
+        return img, mask.long()
+
+def get_transforms(phase):
+    if phase == 'train':
+        return A.Compose([
+            A.Resize(512, 512),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.Rotate(limit=30, p=0.5),
+            # --- اصلاح پارامترهای منسوخ شده ---
+            A.OneOf([
+                # پارامترهای alpha_affine حذف شد تا ارور ندهد
+                A.ElasticTransform(alpha=120, sigma=120 * 0.05, p=0.5),
+                A.GridDistortion(p=0.5),
+                A.OpticalDistortion(distort_limit=1, shift_limit=0.5, p=0.5),
+            ], p=0.3),
+            A.CLAHE(p=0.5),
+            A.RandomBrightnessContrast(p=0.2),
+            A.Normalize(), ToTensorV2()
+        ])
+    return A.Compose([A.Resize(512, 512), A.Normalize(), ToTensorV2()])
+
+# ---------------------------------------------------------
+# 4. 🧠 MODEL
+# ---------------------------------------------------------
+def build_model():
+    return smp.UnetPlusPlus(
+        encoder_name="timm-efficientnet-b6", 
+        encoder_weights="noisy-student",     
+        in_channels=3,
+        classes=2,
+        decoder_attention_type='scse'
+    ).to(Config.DEVICE)
+
+class UltimateLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.dice = smp.losses.DiceLoss(mode='multiclass')
+        self.focal = smp.losses.FocalLoss(mode='multiclass', gamma=2.0)
+        self.tversky = smp.losses.TverskyLoss(mode='multiclass', alpha=0.7, beta=0.3)
+
+    def forward(self, pred, target):
+        return 0.4*self.tversky(pred, target) + 0.4*self.focal(pred, target) + 0.2*self.dice(pred, target)
+
+# ---------------------------------------------------------
+# 5. 🧬 SURGICAL ANALYSIS (QCA)
+# ---------------------------------------------------------
+def quantitative_coronary_analysis(vessel_mask, stenosis_center):
+    skeleton = skeletonize(vessel_mask)
+    dist_transform = distance_transform_edt(vessel_mask)
+    cy, cx = stenosis_center
+    
+    # Find nearest point on centerline
+    y_skel, x_skel = np.where(skeleton > 0)
+    if len(x_skel) == 0: return None
+    distances = np.sqrt((x_skel - cx)**2 + (y_skel - cy)**2)
+    nearest_idx = np.argmin(distances)
+    
+    # Min Diameter
+    obs_radius = dist_transform[y_skel[nearest_idx], x_skel[nearest_idx]]
+    min_diameter_mm = obs_radius * 2 * Config.PIXEL_TO_MM
+    
+    # Ref Diameter
+    ref_radius = np.percentile(dist_transform[skeleton > 0], 90) 
+    ref_diameter_mm = ref_radius * 2 * Config.PIXEL_TO_MM
+    
+    stenosis_pct = (1 - (min_diameter_mm / (ref_diameter_mm + 1e-6))) * 100
+    return {'min_diam_mm': min_diameter_mm, 'ref_diam_mm': ref_diameter_mm, 'stenosis_pct': stenosis_pct}
+
+def analyze_surgical_path(image_np, pred_mask):
+    gray = cv2.cvtColor((image_np*255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    vessel_mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 3)
+    vessel_mask = cv2.morphologyEx(vessel_mask, cv2.MORPH_OPEN, np.ones((3,3),np.uint8))
+    
+    contours, _ = cv2.findContours(pred_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+    
+    cnt = max(contours, key=cv2.contourArea)
+    M = cv2.moments(cnt)
+    if M["m00"] == 0: return None
+    cx, cy = int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])
+    
+    qca = quantitative_coronary_analysis(vessel_mask, (cy, cx))
+    
+    # Smart Scanning for Landing Zone
+    lx, ly = cx, cy
+    found = False
+    for y in range(cy+40, min(512, cy+200), 5):
+        row = vessel_mask[y, max(0, cx-50):min(512, cx+50)]
+        if np.any(row > 0):
+            offset = int(np.mean(np.where(row > 0)[0]))
+            lx = max(0, cx-50) + offset
+            ly = y
+            found = True
+            if y > cy+100: break 
+            
+    if found and qca:
+        angle = abs(90 - abs(math.degrees(math.atan2(ly-cy, lx-cx))))
+        dist_mm = np.sqrt((lx-cx)**2 + (ly-cy)**2) * Config.PIXEL_TO_MM
+        return {'st': (cx, cy), 'ld': (lx, ly), 'angle': angle, 'graft': dist_mm * 1.2, 'qca': qca}
+    return None
+
+# ---------------------------------------------------------
+# 6. 📉 TRAINING ENGINE (FIXED VALIDATION)
+# ---------------------------------------------------------
+def train():
+    torch.cuda.empty_cache()
+    train_ds = ResearchDataset(sources, 'train', get_transforms('train'))
+    val_ds = ResearchDataset(sources, 'val', get_transforms('val'))
+    
+    train_loader = DataLoader(train_ds, batch_size=Config.BATCH_SIZE, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_ds, batch_size=Config.BATCH_SIZE, shuffle=False, num_workers=2)
+    
+    model = build_model()
+    optimizer = optim.AdamW(model.parameters(), lr=Config.LEARNING_RATE, weight_decay=1e-3)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+    criterion = UltimateLoss()
+    scaler = GradScaler()
+    
+    print("🚀 MODEL: EfficientNet-B6 + SCSE Attention")
+    
+    best_f1 = 0.0
+    
+    for epoch in range(Config.NUM_EPOCHS):
+        model.train()
+        loop = tqdm(train_loader, desc=f"Ep {epoch+1}")
+        
+        for img, mask in loop:
+            img, mask = img.to(Config.DEVICE), mask.to(Config.DEVICE)
+            optimizer.zero_grad()
+            with autocast():
+                loss = criterion(model(img), mask)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            loop.set_postfix(loss=f"{loss.item():.3f}")
+        
+        scheduler.step()
+        
+        # --- VALIDATION (CORRECTED TO AVOID INDEX ERROR) ---
+        model.eval()
+        metrics = {'iou': [], 'f1': [], 'acc': [], 'sens': []}
+        
+        with torch.no_grad():
+            for img, mask in val_loader:
+                img, mask = img.to(Config.DEVICE), mask.to(Config.DEVICE)
+                pred_logits = model(img)
+                pred_mask = torch.argmax(pred_logits, dim=1)
+                
+                # 1. دریافت آمار خام (TP, FP, FN, TN) برای همه کلاس‌ها
+                tp, fp, fn, tn = smp.metrics.get_stats(pred_mask.long(), mask.long(), mode='multiclass', num_classes=2)
+                
+                # 2. جدا کردن آمار کلاس 1 (تنگی)
+                # اینجاست که ارور رفع می‌شود: ما قبل از محاسبه میانگین، کلاس ۱ را برمی‌داریم
+                tp_1 = tp[:, 1]
+                fp_1 = fp[:, 1]
+                fn_1 = fn[:, 1]
+                tn_1 = tn[:, 1]
+                
+                # 3. محاسبه متریک‌ها فقط برای کلاس تنگی (reduction='micro' میانگین می‌گیرد و عدد برمی‌گرداند)
+                iou = smp.metrics.iou_score(tp_1, fp_1, fn_1, tn_1, reduction="micro")
+                f1 = smp.metrics.f1_score(tp_1, fp_1, fn_1, tn_1, reduction="micro")
+                acc = smp.metrics.accuracy(tp_1, fp_1, fn_1, tn_1, reduction="micro")
+                sens = smp.metrics.recall(tp_1, fp_1, fn_1, tn_1, reduction="micro")
+                
+                metrics['iou'].append(iou.item())
+                metrics['f1'].append(f1.item())
+                metrics['acc'].append(acc.item())
+                metrics['sens'].append(sens.item())
+
+        avg_iou = np.mean(metrics['iou'])
+        avg_f1 = np.mean(metrics['f1'])
+        avg_acc = np.mean(metrics['acc'])
+        avg_sens = np.mean(metrics['sens'])
+        
+        print(f"   📊 Stenosis IoU: {avg_iou:.4f} | F1: {avg_f1:.4f} | Acc: {avg_acc:.4f}")
+        
+        if avg_f1 > best_f1:
+            best_f1 = avg_f1
+            torch.save(model.state_dict(), f"{Config.SAVE_DIR}/best_research_model.pth")
+
+    return model, val_ds
+
+# ---------------------------------------------------------
+# 7. EXECUTION & REPORT
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    model, val_ds = train()
+    
+    print("\n📋 Generating Final QCA Report...")
+    model.eval()
+    rep = []
+    
+    # تست روی 50 نمونه تصادفی
+    indices = np.random.choice(len(val_ds), min(50, len(val_ds)), replace=False)
+    
+    for i in indices:
+        img, _ = val_ds[i]
+        with torch.no_grad():
+            pred = torch.argmax(model(img.unsqueeze(0).to(Config.DEVICE)), dim=1).cpu().numpy()[0]
+        
+        img_np = (img.permute(1, 2, 0).numpy() * np.array([0.229, 0.224, 0.225])) + np.array([0.485, 0.456, 0.406])
+        img_np = np.clip(img_np, 0, 1)
+        
+        res = analyze_surgical_path(img_np, pred)
+        if res:
+            rep.append({
+                'ID': i,
+                'Stenosis %': round(res['qca']['stenosis_pct'], 1),
+                'Ref Diam (mm)': round(res['qca']['ref_diam_mm'], 2),
+                'Graft Len (mm)': round(res['graft'], 1),
+                'Angle': round(res['angle'], 1)
+            })
+            
+            if len(rep) <= 3:
+                plt.figure(figsize=(8,8))
+                plt.imshow(img_np)
+                plt.imshow(pred, cmap='hot', alpha=0.4)
+                cx, cy = res['st']
+                lx, ly = res['ld']
+                plt.plot(cx, cy, 'rx', markersize=10, label=f"Stenosis {res['qca']['stenosis_pct']:.0f}%")
+                plt.plot(lx, ly, 'g*', markersize=12, label='Anastomosis')
+                
+                t = np.linspace(0,1,100)
+                spline = make_interp_spline(np.linspace(0,1,3), np.c_[[50, cx-40, lx], [50, cy, ly]], k=2)
+                c = spline(t)
+                plt.plot(c[:,0], c[:,1], 'lime', ls='--', lw=2)
+                plt.title(f"Plan | Angle: {res['angle']:.1f}°")
+                plt.legend()
+                plt.axis('off')
+                plt.show()
+
+    if rep:
+        df = pd.DataFrame(rep)
+        print(df.describe())
+        df.to_csv(f"{Config.SAVE_DIR}/final_qca_report.csv", index=False)
+    else:
+        print("No valid surgical paths found in random sample.")
